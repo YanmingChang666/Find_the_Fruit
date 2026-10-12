@@ -1,136 +1,127 @@
-# 🍎 Find the Fruit
+# Find the Fruit
 
-### Zero-Shot Sim2Real RL for Occlusion-Aware Plant Manipulation
+[中文说明](Readme_cn.md)
 
-> **Paper**: [Find the Fruit: Zero-Shot Sim2Real RL for Occlusion-Aware Plant Manipulation](https://arxiv.org/abs/2505.16547)  
-> **Authors**: Nitesh Subedi, Hsin-Jung Yang, Devesh K. Jha, Soumik Sarkar  
-> **arXiv**: [2505.16547](https://arxiv.org/abs/2505.16547)
+An Isaac Lab Direct RL environment for learning arm actions that improve a selected fruit's visibility. The current task evaluates an approximate visibility signal; it does not implement fruit grasping or harvesting.
 
----
+Related paper: [Find the Fruit: Zero-Shot Sim2Real RL for Occlusion-Aware Plant Manipulation](https://arxiv.org/abs/2505.16547), Nitesh Subedi, Hsin-Jung Yang, Devesh K. Jha, and Soumik Sarkar. The paper's real-world results are not validation results for this local checkout.
 
-## Overview
+## Scene and colored spheres
 
-This package implements the **Find the Fruit** simulation environment — a GPU-accelerated Direct RL environment built on [NVIDIA Isaac Lab](https://github.com/isaac-sim/IsaacLab). A robotic arm learns to reposition plant stems and leaves to reveal occluded target fruit(s), trained entirely in simulation and transferred zero-shot to the real world.
+The scene contains a MyBuddy robot, a deformable plant, a fixed RGB-D camera, lights, and two spherical fruit proxies. In `find_the_fruit_env.py`, `_setup_scene()` defines `fruit_colors` and creates spheres with `SphereCfg(radius=0.03)`, with gravity disabled.
 
-Autonomous harvesting in open-field settings presents a complex manipulation problem. Plants exhibit significant structural variation (every plant is different), and target fruits are often heavily occluded by stems and leaves. This environment enables learning occlusion-aware manipulation policies that decouple **high-level kinematic planning** from **low-level compliant control**, simplifying sim-to-real transfer and allowing the learned policy to generalize across plants with different stiffness and morphology.
-
-In real-world experiments with multiple plant setups, the system achieves up to **86.7% success** in exposing target fruits.
-
----
-
-## Environment Details
-
-| Property | Value |
-|---|---|
-| **Gym ID** | `Isaac-FindTheFruit-Direct-v0` |
-| **Robot** | MyBuddy (left arm, 6 DoF) |
-| **Simulator** | NVIDIA Isaac Sim (PhysX) |
-| **RL Framework** | [SKRL](https://github.com/Toni-SM/skrl) (PPO) |
-| **Episode Length** | 5.0 s |
-| **Sim dt** | 1/60 s (decimation = 2) |
-| **Num Envs (default)** | 50 |
-
-### Robot Configuration
-
-The environment uses the **MyBuddy** dual-arm robot (left arm only). Six joints are controlled via position targets:
-
-| Joint | Name |
-|---|---|
-| Base rotation | `bc2bl` |
-| Shoulder | `left_arm_j1` |
-| Elbow | `left_arm_j2` |
-| Wrist 1 | `left_arm_j3` |
-| Wrist 2 | `left_arm_j4` |
-| Wrist 3 | `left_arm_j5` |
-
-### Action Space
-
-- **Type**: `Box(-1, 1)` with shape `(6,)`
-- Actions represent normalized joint velocity offsets scaled by `action_scale × dt`, applied as delta position targets on top of the current joint positions.
-
-### Observation Space
-
-| Key | Shape | Description |
+| Object | Color | Meaning |
 |---|---|---|
-| `joints` | `(6,)` | Current joint positions |
-| `rgb` | `(256, 256, 5)` | Mean-subtracted RGB (3ch) + target fruit mask (1ch) + depth (1ch) |
-| `ee_position` | `(3,)` | End-effector position relative to robot base |
+| `GoalCube_0` | Red | Candidate fruit 0 |
+| `GoalCube_1` | Green | Candidate fruit 1 |
 
-### Scene
+Despite their names, these objects are spheres. Colors distinguish candidates, not success/failure or ripeness. `env_cfg.py` sets `num_goal_cubes = 2`. Blue is the third palette entry but is unused by default.
 
-- **Plant**: Deformable-body USD model (`plant_v21.usd`) with PhysX soft-body simulation — stalks and sub-stalks are attached to the ground plane and respond to contact forces.
-- **Goal Cubes**: Colored spheres representing target fruit positions, randomly repositioned each episode.
-- **Camera**: 256×256 tiled RGB-D camera mounted overhead with pinhole projection.
-- **Background**: USD backdrop with neutral coloring for clean segmentation.
+At each reset, `_reset_idx()` independently samples `target_cube_idx` for each environment: 0 selects red, 1 selects green. Both spheres keep their colors, so color alone does not identify the current target. The reset also randomizes fruit X positions and part of the initial joint configuration, restores the plant, and clears the visibility history.
 
----
+## Core implementation
 
-## Reward Structure
+1. Project the selected fruit's known simulation position into the camera image and generate a rectangular target mask. This is privileged simulation information, not a learned fruit detector.
+2. `_get_observations()` combines mean-subtracted RGB, the target mask, and depth into a `(256, 256, 5)` image. Six joint positions and the three-dimensional end-effector position relative to the robot base are also provided.
+3. The PPO configuration in `agents/skrl_ppo_cfg.yaml` defines convolutional image features and fully connected joint/end-effector features, fused for policy and value estimation.
+4. `_pre_physics_step()` clamps six action values to `[-1, 1]` and converts them into joint position targets: `current_position + action * dt * action_scale`. `_apply_action()` sends these targets to the robot.
+5. The environment evaluates visibility, contact, and actions to compute reward and termination.
 
-The reward function encourages the robot to expose occluded fruits while minimizing unnecessary contact:
+Physics runs at 60 Hz; control runs at 30 Hz (`decimation = 2`). Episodes have a five-second limit. `scene_builder.py` configures deformable plant physics and attachments.
 
-| Component | Description |
+## Rewards and termination
+
+The main reward implementation is `FindTheFruitEnv._get_rewards()` in `find_the_fruit_env.py`. Let `O` be the number of pixels in the intersection of the selected target mask and the depth-based plant mask.
+
+| Component | Formula / condition |
 |---|---|
-| **Occlusion reward** | `(1 − occluded_pixels / mask_area) × 10` — proportional to how much of the target fruit is visible |
-| **Visibility bonus** | `+3.0` when occlusion pixels drop below threshold (160 px) |
-| **Sustained detection** | `+20.0` for maintaining visibility for 10 consecutive steps |
-| **Action penalty** | `-0.06 × ‖action‖` — encourages efficiency once fruit is visible |
-| **Contact penalty** | `-5.0` on any link contact with the plant — discourages damaging collisions |
+| Visibility shaping | `10 * (1 - O / (MASK_SIZE * MASK_SIZE))`, with `MASK_SIZE = 30` |
+| Visibility bonus | `+3` when `O <= 160` |
+| Sustained visibility | `+20` when the last 10 visibility checks all pass |
+| Action penalty | `-0.06 * norm(clamp(action, -1, 1))`, only when visibility passes |
+| Contact penalty | `-5` when any monitored link has nonzero net contact force |
 
-The episode terminates early upon sustained detection (success) or on contact (failure).
+`_calculate_contact_reward()` implements contact detection. It does not identify whether the contacted object is a plant. `_get_dones()` returns contact or the stored success flag as termination, and the episode time limit as truncation. The success flag is set during reward calculation, so termination consumes that stored flag according to the environment step order.
 
----
+Visibility is approximate: `vision_utils.calculate_plant_mask()` classifies every depth pixel between 0.1 and 0.4 m as plant, without semantic segmentation. Consequently, this score is not an exact visible-fruit fraction. Also, the current mask generator can produce a 31-by-31 interior mask for `MASK_SIZE = 30`, while the reward denominator is 900; the normalization is not an exact mask-area ratio.
 
-## Project Structure
+## Run training locally
 
-```
-mybuddy/
-├── __init__.py              # Gym registration (Isaac-FindTheFruit-Direct-v0)
-├── find_the_fruit_env.py    # Main environment class (FindTheFruitEnv)
-├── env_cfg.py               # Environment & robot configuration (FindTheFruitEnvCfg)
-├── scene_builder.py         # Deformable plant spawning & physics attachments
-├── vision_utils.py          # Camera projection, mask generation, plant segmentation
-├── utils.py                 # Depth noise augmentation (sim2real domain randomization)
-├── assets.py                # USD asset paths
-├── assets/
-│   ├── mybuddy_rotate.usd   # MyBuddy robot model
-│   ├── plant_v21.usd        # Deformable plant model
-│   └── background.usd       # Scene background
-└── agents/
-    └── skrl_ppo_cfg.yaml    # SKRL PPO training hyperparameters
-```
+The local launcher targets the existing installation:
 
----
+- Conda environment: `/home/cym/anaconda3/envs/lab2.1`
+- Isaac Lab: `/home/cym/isaac_sim_projects/IsaacLab-2.1.0`
+- Isaac Sim: `/home/cym/isaac-sim-4.5.0`
+- Tested installed libraries: skrl 2.0.0 and PyTorch 2.13.0+cu130
 
-## Getting Started
-
-### Prerequisites
-
-- [NVIDIA Isaac Sim 4.5+](https://docs.isaacsim.omniverse.nvidia.com/latest/index.html)
-- [Isaac Lab](https://github.com/isaac-sim/IsaacLab) (installed and configured)
-- [SKRL](https://github.com/Toni-SM/skrl) RL library
-
-### Training
+`train.py` is adapted from the Isaac Lab 2.1 official skrl trainer and imports this task after starting SimulationApp. `run_train.sh` activates the environment and loads simulator paths. For another machine, edit the installation paths in `run_train.sh`; keep the package directory named `Find_the_Fruit`, which the training entry point imports.
 
 ```bash
-# From the IsaacLab root directory
-./isaaclab.sh -p -m skrl_cfg --task Isaac-FindTheFruit-Direct-v0 --headless
+cd /home/cym/ROS/Arms/Find_the_Fruit
+
+# Short check: 2 environments, 2 PPO iterations = 64 vectorized steps
+bash run_train.sh --headless --num_envs 2 --max_iterations 2
+
+# Default: 8 environments, 400,000 vectorized steps
+bash run_train.sh --headless
+
+# Try more parallel environments
+bash run_train.sh --headless --num_envs 16
+
+# Show the simulation window
+bash run_train.sh
 ```
 
-### Key Training Hyperparameters (PPO)
+The launcher always enables cameras. `num_envs` counts parallel copies sharing a policy, not independently trained agents. The environment config defaults to 50, while the launcher selects 8 unless overridden. With rollout length 32, each PPO rollout contains `32 * num_envs` samples. Increase to 16 or 32 only after checking memory and total sample throughput; no optimal environment count has been established.
 
-| Parameter | Value |
+Current PPO settings: 32 rollout steps, 5 learning epochs, 8 mini-batches, learning rate 3e-4 with KL adaptation, discount 0.99, and GAE lambda 0.95. The YAML uses skrl 2.x `OBSERVATIONS[...]` inputs.
+
+A two-environment, 64-step training check completed and exited successfully on the local RTX 4090. This is a smoke test, not evidence of convergence or long-run stability.
+
+Outputs are saved under `logs/skrl/mybuddy_direct/`; Hydra can also create `outputs/`. Both are ignored by Git.
+
+```bash
+# After activating lab2.1
+ tensorboard --logdir logs/skrl/mybuddy_direct
+```
+
+## Files
+
+| File | Responsibility |
 |---|---|
-| Rollout steps | 32 |
-| Learning epochs | 5 |
-| Mini-batches | 8 |
-| Learning rate | 3e-4 (KL-adaptive) |
-| Discount (γ) | 0.99 |
-| GAE (λ) | 0.95 |
-| Total timesteps | 400,000 |
-| Gradient clip | 1.0 |
+| `__init__.py` | Registers `Isaac-FindTheFruit-Direct-v0` |
+| `train.py`, `run_train.sh` | Training entry point and local launcher |
+| `env_cfg.py` | Robot, camera, action/observation spaces and simulation settings |
+| `find_the_fruit_env.py` | Scene, action execution, observations, rewards and resets |
+| `scene_builder.py` | Deformable plant and attachments |
+| `vision_utils.py` | Projection helpers, target masks and depth thresholding |
+| `agents/skrl_ppo_cfg.yaml` | PPO and network configuration |
+| `assets.py`, `assets/` | Required USD models and textures; keep these in Git |
+| `utils.py` | Additional depth estimation/noise utilities; not used in the current main environment path |
 
----
+## Upload changes to Git
+
+The configured remote is `https://github.com/YanmingChang666/Find_the_Fruit.git`, and the current branch is `master`. Run from this project directory:
+
+```bash
+# Review changes and ensure generated data are ignored
+ git status --short
+ git diff
+ git status --short --ignored
+
+# Stage source, documentation and required assets; .gitignore excludes generated data
+ git add .
+ git diff --cached --stat
+ git diff --cached
+
+# Commit and push after reviewing
+ git commit -m "Add local training launcher and bilingual documentation"
+ git push -u origin master
+```
+
+Push requires write access to the remote and configured GitHub authentication. If using a different repository, create an empty remote repository and change the URL with `git remote set-url origin <your-repository-url>` before pushing. If the remote has newer commits, integrate them before retrying; do not force-push over others' work.
+
+`.gitignore` excludes logs, Hydra outputs, checkpoints, videos, Python caches, virtual environments, and common editor/temporary files. Required USD models and textures remain included. Ignore rules do not untrack existing files: the previously tracked `agents/__pycache__/__init__.cpython-311.pyc` is removed from the Git index while its local copy is preserved. This removal takes effect in the next commit; it does not rewrite history.
 
 ## Citation
 

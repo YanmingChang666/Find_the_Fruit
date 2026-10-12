@@ -1,0 +1,42 @@
+# Python caches and build products
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Training, Hydra, tracking and exported policies
+logs/
+outputs/
+multirun/
+checkpoints/
+runs/
+wandb/
+videos/
+*.log
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.tfevents.*
+*.mp4
+
+# Local environments and editor files
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+.vscode/
+.idea/
+.DS_Store
+*~
+*.swp
+*.swo
+*.tmp
+*.bak

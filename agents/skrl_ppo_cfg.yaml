@@ -10,7 +10,7 @@ models:
     initial_log_std: 0.0
     network:
     - name: image_features
-      input: permute(STATES['rgb'], (0, 3, 1, 2))
+      input: permute(OBSERVATIONS['rgb'], (0, 3, 1, 2))
       layers:
       - conv2d:
           out_channels: 32
@@ -35,13 +35,13 @@ models:
       - flatten
       activations: elu
     - name: ee_features
-      input: STATES['ee_position']
+      input: OBSERVATIONS['ee_position']
       layers:
       - 64
       - 64
       activations: elu
     - name: joint_features
-      input: STATES['joints']
+      input: OBSERVATIONS['joints']
       layers:
       - 64
       - 64
@@ -57,7 +57,7 @@ models:
     clip_actions: false
     network:
     - name: image_features
-      input: permute(STATES['rgb'], (0, 3, 1, 2))
+      input: permute(OBSERVATIONS['rgb'], (0, 3, 1, 2))
       layers:
       - conv2d:
           out_channels: 64
@@ -82,13 +82,13 @@ models:
       - flatten
       activations: elu
     - name: ee_features
-      input: STATES['ee_position']
+      input: OBSERVATIONS['ee_position']
       layers:
       - 128
       - 128
       activations: elu
     - name: joint_features
-      input: STATES['joints']
+      input: OBSERVATIONS['joints']
       layers:
       - 128
       - 128

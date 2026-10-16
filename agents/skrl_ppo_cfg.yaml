@@ -1,14 +1,26 @@
+# skrl PPO 训练配置（Find-the-Fruit）
+# 观测是字典：rgb(256x256x5) / ee_position(3) / joints(6)，
+# 因此网络分成三条分支（图像 CNN、末端位置 MLP、关节 MLP），最后拼接。
 seed: 42
+
 models:
+  # separate: false → skrl 把 policy 和 value 当作"共享模型"构建（共享骨干）。
+  # 注意：共享时下方 value.network 里自己定义的网络很可能不会生效，
+  # 若想让 Critic 使用独立且更宽的网络，通常需要改成 separate: true，请自行确认。
   separate: false
+
+  # ---------------- Actor（策略网络）：输出 6 维动作的高斯分布 ----------------
   policy:
     class: GaussianMixin
-    clip_actions: true
-    clip_log_std: true
+    clip_actions: true        # 采样出的动作截断到动作空间范围 [-1, 1]
+    clip_log_std: true        # 限制 log_std 范围，防止数值爆炸/塌缩
     min_log_std: -20.0
     max_log_std: 2.0
-    initial_log_std: 0.0
+    initial_log_std: 0.0      # 初始 std = 1.0，探索幅度较大
     network:
+    # --- 分支 1：图像特征 ---
+    # 输入 (N,256,256,5) → permute 成 (N,5,256,256)（PyTorch 的 NCHW 格式）。
+    # 卷积尺寸变化：256 → 63 → 30 → 28 → 26，最终 flatten 为 128*26*26 = 86528 维。
     - name: image_features
       input: permute(OBSERVATIONS['rgb'], (0, 3, 1, 2))
       layers:
@@ -34,24 +46,30 @@ models:
           padding: 0
       - flatten
       activations: elu
+    # --- 分支 2：末端位置 (3,) → 两层 64 的 MLP ---
     - name: ee_features
       input: OBSERVATIONS['ee_position']
       layers:
       - 64
       - 64
       activations: elu
+    # --- 分支 3：关节角度 (6,) → 两层 64 的 MLP ---
     - name: joint_features
       input: OBSERVATIONS['joints']
       layers:
       - 64
       - 64
       activations: elu
+    # --- 融合：三路特征拼接后接 512 维全连接，再由 output 映射为动作均值 ---
     - name: combined
       input: concatenate([image_features, ee_features, joint_features])
       layers:
       - 512
       activations: elu
     output: ACTIONS
+
+  # ---------------- Critic（价值网络）：输出标量状态价值 V(s) ----------------
+  # 结构与 Actor 类似，但 MLP 更宽（128）、融合层更窄（256）、第一层卷积通道 64。
   value:
     class: DeterministicMixin
     clip_actions: false
@@ -98,51 +116,60 @@ models:
       layers:
       - 256
       activations: elu
-    output: ONE
+    output: ONE               # 输出单个标量价值
+
+# 经验缓冲：-1 表示容量自动等于 rollouts（on-policy，用完即弃）
 memory:
   class: RandomMemory
   memory_size: -1
+
 agent:
   class: PPO
-  rollouts: 32
-  learning_epochs: 5
-  mini_batches: 8
-  discount_factor: 0.99
-  lambda: 0.95
+  rollouts: 32                # 每次更新前每个环境采集 32 步；一次更新样本 = 32 × num_envs(50) = 1600
+  learning_epochs: 5          # 每批数据重复训练 5 个 epoch
+  mini_batches: 8             # 每个 epoch 切成 8 个小批（每批约 200 样本）
+  discount_factor: 0.99       # 折扣因子 γ
+  lambda: 0.95                # GAE 的 λ
   learning_rate: 0.0003
-  learning_rate_scheduler: KLAdaptiveLR
+  learning_rate_scheduler: KLAdaptiveLR   # 根据 KL 散度自适应调节学习率
   learning_rate_scheduler_kwargs:
-    kl_threshold: 0.008
+    kl_threshold: 0.008       # 目标 KL；偏离过大则降低学习率，过小则提高
+  # 观测归一化：对字典观测的各字段做运行均值/方差标准化。
+  # device 写死为 cuda:0，多卡 --distributed 训练时需要改成对应的卡。
   state_preprocessor: RunningStandardScaler
   state_preprocessor_kwargs:
     size: observation_space
     device: cuda:0
+  # 价值目标（回报）归一化，稳定 Critic 训练
   value_preprocessor: RunningStandardScaler
   value_preprocessor_kwargs:
     size: 1
     device: cuda:0
-  random_timesteps: 0
+  random_timesteps: 0         # 开局纯随机探索步数（PPO 不需要）
   learning_starts: 0
-  grad_norm_clip: 1.0
-  ratio_clip: 0.2
-  value_clip: 0.2
+  grad_norm_clip: 1.0         # 梯度裁剪
+  ratio_clip: 0.2             # PPO 策略比值裁剪范围 ε
+  value_clip: 0.2             # 价值函数裁剪范围（仅在 clip_predicted_values 为 true 时生效）
   clip_predicted_values: false
-  entropy_loss_scale: 0.01
-  value_loss_scale: 2.0
-  kl_threshold: 0.0
-  rewards_shaper_scale: 2.0
-  time_limit_bootstrap: false
+  entropy_loss_scale: 0.01    # 熵正则系数，鼓励探索
+  value_loss_scale: 2.0       # 价值损失权重
+  kl_threshold: 0.0           # 0 表示不做基于 KL 的提前终止
+  rewards_shaper_scale: 2.0   # 环境奖励在送入算法前统一乘以 2
+  time_limit_bootstrap: false # 超时截断时不对价值做 bootstrap
   experiment:
-    directory: "mybuddy_direct"
+    directory: "mybuddy_direct"   # 日志根目录：logs/skrl/mybuddy_direct
     experiment_name: ""
-    write_interval: 100
-    checkpoint_interval: 5000
+    write_interval: 100           # 每 100 步写一次 TensorBoard
+    checkpoint_interval: 5000     # 每 5000 步存一次检查点
     wandb: False
     wandb_kwargs:
       project: "IsaacLab_Implementation"
       name: "mybuddy_direct_cluttered_background"
+
 trainer:
   class: SequentialTrainer
+  # 总时间步 400000；每个"迭代"= rollouts(32) 步，约 12500 次 PPO 更新。
+  # train.py 的 --max_iterations 会把它覆盖为 max_iterations × rollouts。
   timesteps: 400000
   environment_info: log
   close_environment_at_exit: false

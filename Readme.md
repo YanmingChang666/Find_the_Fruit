@@ -136,3 +136,14 @@ If you find this code useful in your research, please cite:
   url     = {https://arxiv.org/abs/2505.16547}
 }
 ```
+
+## Play a saved policy
+
+Uses the existing lab2.1 environment. Pass an explicit checkpoint; this runs inference without updating weights. The launcher defaults to two environments.
+
+```bash
+bash run_play.sh --real-time --checkpoint logs/skrl/mybuddy_direct/<run>/checkpoints/agent_175000.pt
+
+# Headless smoke test
+bash run_play.sh --headless --max_steps 150 --checkpoint logs/skrl/mybuddy_direct/<run>/checkpoints/agent_175000.pt
+```

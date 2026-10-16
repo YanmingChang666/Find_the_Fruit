@@ -9,6 +9,9 @@ htmlcov/
 build/
 dist/
 *.egg-info/
+.venv-tensorboard/
+docs/
+
 
 # Training, Hydra, tracking and exported policies
 logs/

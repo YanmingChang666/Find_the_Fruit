@@ -181,8 +181,20 @@ class FindTheFruitEnvCfg(DirectRLEnvCfg):
     # ------------------------------------------------------------------
     # 任务自定义参数
     # ------------------------------------------------------------------
-    # max_y_pos 与 rew_scale_alive 在当前环境代码中并未被使用（遗留参数）。
+    # max_y_pos 在当前环境代码中并未被使用（遗留参数）。
     max_y_pos = 0.0
     # 连续可见性判定窗口：detection_sequence 队列长度（10 步 ≈ 0.33 s）。
     maxlen = 10
-    rew_scale_alive = -0.1
+
+    # ---- 奖励参数（对应 find_the_fruit_env.py 的 [修改3]/[修改5]）----
+    # 约束关系（务必保持）：
+    #   |rew_scale_contact| > |rew_scale_alive| × max_episode_steps(≈150)
+    #   rew_scale_success  >  0，且要明显大于全程可见性奖励之外的“拖延收益”
+    # 否则智能体会学到：撞上去结束回合比继续活着更划算 / 不成功比成功更划算。
+    rew_scale_alive = -0.05        # 每步存活惩罚；150 步累计最多 -7.5
+    rew_scale_progress = 5.0       # 遮挡比例每下降 1.0 得 5 分（上升则扣分）
+    rew_scale_visible = 0.5        # 目标可见（遮挡像素 ≤ 阈值）时的每步小奖励
+    rew_scale_success = 30.0       # 连续可见 maxlen 步后一次性发放，随后回合终止
+    rew_scale_contact = -20.0      # 接触惩罚（接触同时终止回合）
+    visible_pixel_threshold = 160  # 遮挡像素 ≤ 该值视为“可见”（原版硬编码为 160）
+    contact_ignore_steps = 2       # 重置后前几步忽略接触读数

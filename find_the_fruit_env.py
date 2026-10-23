@@ -3,6 +3,17 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
+# =====================================================================
+# 本文件相对原版的修改汇总（搜索 [修改N] 可定位）：
+#   [修改1] __init__：新增 prev_occ / in_contact / contact_reward 缓冲
+#   [修改2] 深度图清洗并裁剪到 [0,1]（配合 yaml 去掉图像的逐像素标准化）
+#   [修改3] 奖励重写：进步奖励 + 一次性成功大奖 + 存活惩罚；修复成功奖励重复发放
+#   [修改4] _reset_idx：清零 done / in_contact / prev_occ（修复“回合长度为 1”的 bug）
+#   [修改5] 接触判定：重置后的前几步忽略接触读数，惩罚幅度改由配置控制
+#   [修改6] 通过 extras["log"] 记录成功率/遮挡量/接触率，方便在 TensorBoard 中观察
+#   [修改7] 按连杆分别记录接触比例（contact_<连杆名>），定位碰撞来源
+# =====================================================================
+
 from __future__ import annotations
 
 import numpy as np
@@ -93,6 +104,18 @@ class FindTheFruitEnv(DirectRLEnv):
         # 并未使用 occlusion_time_below_threshold 这个计时变量。
         self.occlusion_time_below_threshold = torch.zeros(self.num_envs, 1, device=self.device)
         self.joint_readings = self._robot.data.joint_pos[:, self._arm_dof_idx]
+
+        # [修改1] 新增缓冲：
+        #   prev_occ       ：上一步目标被遮挡的比例，用于计算“遮挡减少量”（进步奖励）
+        #   in_contact     ：是否接触；先给初值，避免首次读取前未定义
+        #   contact_reward ：接触惩罚（每步由 _get_dones 更新）
+        self.prev_occ = torch.ones(self.num_envs, device=self.device)
+        self.in_contact = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
+        self.contact_reward = torch.zeros(self.num_envs, device=self.device)
+        # [修改7] 各连杆接触标志 (N, 连杆数)，在 _calculate_contact_reward 中更新，用于日志
+        self.link_contact = torch.zeros(
+            (self.num_envs, len(self.cfg.link_dof_name)), device=self.device, dtype=torch.bool
+        )
 
     def close(self):
         # 交由父类释放环境、传感器等资源；仿真应用本身由训练/演示入口关闭。
@@ -244,6 +267,11 @@ class FindTheFruitEnv(DirectRLEnv):
         # 这里没有进行深度归一化，也没有显式处理 NaN；缓存还会被奖励函数读取。
         self.depth_image = self._tiled_camera.data.output["depth"].clone()
         self.depth_image[self.depth_image == float("inf")] = 0
+        # [修改2] 额外处理 NaN/无穷，并把深度裁剪到 [0, 1] 米：
+        # 植物所在的 0.1~0.4 m 完全保留，掩码判断不受影响；
+        # 同时让图像通道的数值范围与 rgb(约 [-1,1])、掩码(0/1) 相当，
+        # 这样 yaml 中可以去掉对整幅图像的逐像素 RunningStandardScaler。
+        self.depth_image = torch.nan_to_num(self.depth_image, nan=0.0, posinf=0.0, neginf=0.0).clamp(0.0, 1.0)
 
         # 取末端连杆 left_arm_l6 的世界质心坐标，减去根部世界质心坐标。
         # 这是世界坐标轴下的相对位移，不包含末端朝向，也没有逆旋转到基座坐标轴。
@@ -278,64 +306,77 @@ class FindTheFruitEnv(DirectRLEnv):
     # ------------------------------------------------------------------
 
     def _get_rewards(self) -> torch.Tensor:
-        # 为每个并行环境返回一个即时奖励，最终形状为 (N,)，N = num_envs。
-        # 总奖励 = 可见性连续奖励 + 达标奖励 + 持续达标奖励 + 动作惩罚 + 接触惩罚。
-        # 这些是环境原始奖励；训练端是否再次缩放由算法配置决定。
-        # 注意本机 Lab 2.1 的 step 顺序为：终止检查 → 奖励 → 重置 → 观测。
-        # 因此这里读取的是上次 _get_observations 缓存的 depth_image，
-        # 而 contact_reward 已由本步 _get_dones 更新；两者的采样时刻并不完全一致。
+        # 为每个并行环境返回一个即时奖励，形状 (N,)。
+        # 注意 Lab 的 step 顺序：终止检查 → 奖励 → 重置 → 观测，
+        # 因此这里读取的是上次 _get_observations 缓存的 depth_image。
+        #
+        # [修改3] 奖励结构（原版的问题：遮挡奖励几乎恒为正，且成功会终止回合，
+        #        导致“拖时间”比“成功”更赚）。新版：
+        #   总奖励 = 进步奖励 + 可见性小奖励 + 一次性成功大奖
+        #            + 存活惩罚 + 接触惩罚 + 动作惩罚
+        #   - 进步奖励   ：只有遮挡比例“下降”才得分，上升会扣分（势函数式塑形，不再白拿基线分）
+        #   - 成功大奖   ：连续 maxlen 步满足阈值时发放一次，且回合随后终止
+        #   - 存活惩罚   ：每步小额负奖励，鼓励尽快完成
+        #   - 接触惩罚   ：绝对值须大于“全程存活惩罚之和”，否则智能体会为了
+        #                  少付存活惩罚而主动撞上去提前终止（见 env_cfg 中的参数说明）
 
-        # 1. 通过深度阈值生成“植物”近似掩码，形状为 (N, H, W, 1)。
-        # 这是距离筛选，不是语义分割：同深度范围的其他物体也可能被计入。
+        # 1. 植物近似掩码（深度 0.1~0.4 m），形状 (N,H,W,1)
         plant_mask = calculate_plant_mask(self.depth_image)
 
-        # 2. 从所有水果的掩码中选取本回合指定目标。
-        # target_cube_idx: (N,)，默认 0=红球、1=绿球；one_hot: (N, 1, 1, K)。
-        # cube_maskas: (N, H, W, K)，K 是水果数量；广播相乘后沿 K 求和。
+        # 2. 选出各环境的目标水果掩码，并与植物掩码相交，得到遮挡像素数 O
         one_hot = F.one_hot(self.target_cube_idx, num_classes=self.cfg.num_goal_cubes).float().unsqueeze(1).unsqueeze(1)
         selected_mask = torch.sum(self.cube_maskas * one_hot, dim=3, keepdim=True)
-        # selected_mask: (N, H, W, 1)。与植物掩码相乘得到交集，
-        # 对所有图像维度求和，得到各环境的遮挡像素数 O，形状为 (N, 1)。
-        occlusion_pixels = torch.sum(selected_mask * plant_mask, dim=(1, 2, 3)).reshape(-1, 1)
-        # 3. 连续可见性奖励：10 × (1 - O / 900)，O 越小奖励越大。
-        # MASK_SIZE 默认 30；这里并未将奖励截断到 [0, 10]。
-        # 当前掩码生成代码在区域不被边界截断时可能生成 31×31 的区域，
-        # 但分母仍是 30×30，所以该比值不是精确遮挡比例，奖励也可能略小于 0。
-        occlusion_reward = (1 - occlusion_pixels / (MASK_SIZE * MASK_SIZE)) * 10.0
+        occlusion_pixels = torch.sum(selected_mask * plant_mask, dim=(1, 2, 3))  # (N,)
 
-        # 4. 阈值达标奖励：O <= 160 时额外 +3，否则为 0。
-        # 名字中的 full_visibility 表示满足阈值，不表示完全无遮挡。
-        full_visibility_reward = torch.where(
-            occlusion_pixels <= 160,
-            torch.tensor(3.0, device=self.device),
-            torch.tensor(0.0, device=self.device),
-        ).reshape(self.num_envs)
+        # 3. 遮挡比例：夹到 [0,1]。分母仍用 MASK_SIZE²，
+        #    掩码实际可能是 31×31，夹取后比例不再越界。
+        occ_frac = (occlusion_pixels / (MASK_SIZE * MASK_SIZE)).clamp(0.0, 1.0)
 
-        # 将每个环境本次是否达标写入历史队列；该条件是布尔量 (N,)。
-        # 队列长度由 cfg.maxlen 控制，默认 10；重置时对应环境的历史清零。
-        full_visibility_mask = full_visibility_reward > 0
-        self.detection_sequence.append(full_visibility_mask)
+        # 4. 进步奖励：上一步遮挡比例 - 当前遮挡比例（下降为正）。
+        #    回合第 1 步没有可比较的上一步，置 0，避免凭空得到“一整个回合开头的差值”。
+        first_step = self.episode_length_buf <= 1
+        progress = torch.where(first_step, torch.zeros_like(occ_frac), self.prev_occ - occ_frac)
+        progress_reward = progress * self.cfg.rew_scale_progress
+        self.prev_occ = occ_frac.clone()
 
-        # 5. 将历史堆叠为 (maxlen, N)，沿时间维检查是否连续全部达标。
-        # 默认 30 Hz 下 10 次检查对应约 0.33 秒的检查窗口。
-        # 持续达标奖励为 +20；代码没有“仅首次达标发放”的额外锁存条件。
-        sustained_detection = torch.all(torch.stack(list(self.detection_sequence)), dim=0)
-        sustained_reward = sustained_detection.float() * 20.0
+        # 5. 可见性：遮挡像素 ≤ 阈值视为“目标可见”，给小额奖励，并写入历史队列
+        visible = occlusion_pixels <= self.cfg.visible_pixel_threshold
+        visible_reward = visible.float() * self.cfg.rew_scale_visible
+        self.detection_sequence.append(visible)
 
-        # 6. 动作惩罚：对截断后的六维原始动作取 L2 范数，再乘 -0.06。
-        # 惩罚对象是策略动作，不是实际关节速度、位移或相邻动作之差。
+        # 6. 连续 maxlen 步都可见 → 成功。
+        #    只在“新成功”的那一步发奖：self.done 此时保存的是上一步的成功标志，
+        #    用 ~self.done 过滤掉终止那一步的重复发放（原版会发两次 +20）。
+        sustained = torch.all(torch.stack(list(self.detection_sequence)), dim=0)
+        new_success = sustained & (~self.done)
+        success_reward = new_success.float() * self.cfg.rew_scale_success
+
+        # 7. 动作惩罚：仅在可见时生效，鼓励看到目标后少乱动
         action_penalty = torch.norm(self.raw_actions.clamp(-1.0, 1.0), dim=1) * -0.06
-        # 仅在本次可见性达标时启用，鼓励目标已可见后减少不必要运动。
-        action_penalty *= full_visibility_mask.float()
+        action_penalty = action_penalty * visible.float()
 
-        # 保存持续达标标志，供后续终止检查读取；此处不直接调用 reset。
-        # 因 _get_dones 先于本函数执行，不能把此赋值理解成本步即时终止。
-        self.done = sustained_detection
-        occlusion_reward = occlusion_reward.reshape(self.num_envs)
+        # 8. 存活惩罚（每步常数）
+        alive_penalty = torch.full((self.num_envs,), self.cfg.rew_scale_alive, device=self.device)
 
-        # 所有分项统一为 (N,) 后相加。接触惩罚的计算见 _calculate_contact_reward。
-        # 累计回报同时受每步奖励和回合长度影响，不等同于任务成功率。
-        return self.contact_reward + full_visibility_reward + sustained_reward + action_penalty + occlusion_reward
+        # 保存成功标志，供下一步 _get_dones 读取并终止；重置时会在 _reset_idx 中清零
+        self.done = sustained
+
+        # [修改6] 训练过程指标：在 TensorBoard 的 "Info / ..." 下查看
+        self.extras.setdefault("log", {})
+        self.extras["log"].update({
+            "success_rate": new_success.float().mean(),
+            "occlusion_frac": occ_frac.mean(),
+            "visible_frac": visible.float().mean(),
+            "contact_frac": self.in_contact.float().mean(),
+        })
+        # [修改7] 各连杆的接触比例：看是末端（多半碰到植物/水果）还是靠近基座的连杆（地面或自碰撞）
+        for i, name in enumerate(self.cfg.link_dof_name):
+            self.extras["log"][f"contact_{name}"] = self.link_contact[:, i].float().mean()
+
+        return (
+            progress_reward + visible_reward + success_reward + alive_penalty
+            + self.contact_reward + action_penalty
+        )
 
     # ------------------------------------------------------------------
     # Dones
@@ -444,6 +485,15 @@ class FindTheFruitEnv(DirectRLEnv):
         tensor_seq[:, env_ids] = 0
         self.detection_sequence = deque(list(tensor_seq), maxlen=self.cfg.maxlen)
 
+        # [修改4] 清零上一回合遗留的标志（原版缺失，会导致成功后下一回合第 1 步就被终止）：
+        #   done       ：持续达标标志
+        #   in_contact ：接触标志
+        #   prev_occ   ：上一步遮挡比例（新回合第 1 步不计进步奖励，这里只是复位）
+        self.done[env_ids] = False
+        self.in_contact[env_ids] = False
+        self.contact_reward[env_ids] = 0.0
+        self.prev_occ[env_ids] = 1.0
+
     # ------------------------------------------------------------------
     # 辅助函数：汇总接触传感器并计算惩罚
     # ------------------------------------------------------------------
@@ -452,12 +502,27 @@ class FindTheFruitEnv(DirectRLEnv):
         # 读取 cfg.link_dof_name 对应的连杆接触传感器。
         # 各传感器 net_forces_w 为 (N, B_i, 3)，表示世界坐标系中的净接触力；
         # 沿刚体维拼接，得到 (N, sum(B_i), 3)。这里只使用当前读数，没有使用历史。
-        readings = torch.cat(
-            [self.scene.sensors[f"contact_sensor_{i}"].data.net_forces_w for i in range(num_sensors)], dim=1
-        )
-        # 对刚体和 XYZ 分量求 any：任意一个分量非零就标记接触。
+        # [修改7] 按连杆分别判断接触，形状 (N, num_sensors)，用于在 TensorBoard 中定位碰撞来源。
+        # 对每个传感器的刚体和 XYZ 分量求 any：任意一个分量非零就标记接触。
         # 这里没有设置力阈值，也没有过滤“是否与植物接触”。
         # 因此应理解为净接触力非零检测，而非碰撞严重程度或植物损伤估计。
-        self.in_contact = torch.any(readings != 0, dim=(1, 2))
-        # 有接触返回 -5，无接触返回 0；接触还会在 _get_dones 中触发终止。
-        return torch.where(self.in_contact, torch.tensor(-5.0, device=self.device), torch.tensor(0.0, device=self.device))
+        link_contact = torch.stack(
+            [
+                torch.any(self.scene.sensors[f"contact_sensor_{i}"].data.net_forces_w != 0, dim=(1, 2))
+                for i in range(num_sensors)
+            ],
+            dim=1,
+        )
+        # [修改5] 重置后的前 contact_ignore_steps 步忽略接触：
+        # 刚重置时传感器可能还残留上一回合的受力读数，或初始姿态有瞬时穿插，
+        # 若直接判为接触会产生大量长度为 1 的无效回合。
+        valid = self.episode_length_buf > self.cfg.contact_ignore_steps
+        self.link_contact = link_contact & valid.unsqueeze(1)
+        self.in_contact = self.link_contact.any(dim=1)
+        # 有接触返回 rew_scale_contact，无接触返回 0；接触还会在 _get_dones 中触发终止。
+        # [修改5] 惩罚幅度改由 cfg.rew_scale_contact 控制（默认 -20）
+        return torch.where(
+            self.in_contact,
+            torch.tensor(self.cfg.rew_scale_contact, device=self.device),
+            torch.tensor(0.0, device=self.device),
+        )

@@ -1,13 +1,22 @@
 # skrl PPO 训练配置（Find-the-Fruit）
 # 观测是字典：rgb(256x256x5) / ee_position(3) / joints(6)，
 # 因此网络分成三条分支（图像 CNN、末端位置 MLP、关节 MLP），最后拼接。
+#
+# [修改7] 2026-10-23 根据三次训练日志的调整：
+#   日志显示学习率在前几次更新就被 KLAdaptiveLR 压到下限（94%~98% 的时间停在下限），
+#   策略标准差几乎不变，训练后期策略损失爆炸到 1e8~1e17。
+#   主因：CNN 展平后 86528 维直接接 512 全连接，Adam 每步的小改动在这层被放大，
+#   学习率再小 KL 也超标。本次改动：
+#   - CNN 后两层改为 stride 2、末层 64 通道，展平维度 86528 → 2304
+#   - 去掉 KLAdaptiveLR，固定学习率；用 kl_threshold 做安全阀（KL 超标就提前结束本轮 epoch）
+#   - separate: true，Actor / Critic 各用一套网络，价值损失不再干扰策略特征
+#   - rollouts 32 → 64，配合 run_train.sh 默认 16 个环境，每次更新 1024 个样本
+#   - time_limit_bootstrap: true，超时截断不再被当作真正的终止
 seed: 42
 
 models:
-  # separate: false → skrl 把 policy 和 value 当作"共享模型"构建（共享骨干）。
-  # 注意：共享时下方 value.network 里自己定义的网络很可能不会生效，
-  # 若想让 Critic 使用独立且更宽的网络，通常需要改成 separate: true，请自行确认。
-  separate: false
+  # separate: true → Actor 和 Critic 各自独立构建，下面两段网络配置都会生效。
+  separate: true
 
   # ---------------- Actor（策略网络）：输出 6 维动作的高斯分布 ----------------
   policy:
@@ -16,11 +25,12 @@ models:
     clip_log_std: true        # 限制 log_std 范围，防止数值爆炸/塌缩
     min_log_std: -20.0
     max_log_std: 2.0
-    initial_log_std: 0.0      # 初始 std = 1.0，探索幅度较大
+    initial_log_std: -0.5     # 初始 std ≈ 0.61
     network:
     # --- 分支 1：图像特征 ---
     # 输入 (N,256,256,5) → permute 成 (N,5,256,256)（PyTorch 的 NCHW 格式）。
-    # 卷积尺寸变化：256 → 63 → 30 → 28 → 26，最终 flatten 为 128*26*26 = 86528 维。
+    # [修改7] 卷积尺寸变化：256 → 63 → 30 → 14 → 6，flatten 为 64*6*6 = 2304 维
+    #         （原为 128*26*26 = 86528 维）。
     - name: image_features
       input: permute(OBSERVATIONS['rgb'], (0, 3, 1, 2))
       layers:
@@ -30,19 +40,19 @@ models:
           stride: 4
           padding: 0
       - conv2d:
-          out_channels: 128
+          out_channels: 64
           kernel_size: 4
           stride: 2
           padding: 0
       - conv2d:
-          out_channels: 128
+          out_channels: 64
           kernel_size: 3
-          stride: 1
+          stride: 2
           padding: 0
       - conv2d:
-          out_channels: 128
+          out_channels: 64
           kernel_size: 3
-          stride: 1
+          stride: 2
           padding: 0
       - flatten
       activations: elu
@@ -60,16 +70,16 @@ models:
       - 64
       - 64
       activations: elu
-    # --- 融合：三路特征拼接后接 512 维全连接，再由 output 映射为动作均值 ---
+    # --- 融合：三路特征拼接后接 256 维全连接，再由 output 映射为动作均值 ---
     - name: combined
       input: concatenate([image_features, ee_features, joint_features])
       layers:
-      - 512
+      - 256
       activations: elu
     output: ACTIONS
 
   # ---------------- Critic（价值网络）：输出标量状态价值 V(s) ----------------
-  # 结构与 Actor 类似，但 MLP 更宽（128）、融合层更窄（256）、第一层卷积通道 64。
+  # separate: true 后这段配置真正生效，与 Actor 不共享参数。
   value:
     class: DeterministicMixin
     clip_actions: false
@@ -78,24 +88,24 @@ models:
       input: permute(OBSERVATIONS['rgb'], (0, 3, 1, 2))
       layers:
       - conv2d:
-          out_channels: 64
+          out_channels: 32
           kernel_size: 8
           stride: 4
           padding: 0
       - conv2d:
-          out_channels: 128
+          out_channels: 64
           kernel_size: 4
           stride: 2
           padding: 0
       - conv2d:
-          out_channels: 128
+          out_channels: 64
           kernel_size: 3
-          stride: 1
+          stride: 2
           padding: 0
       - conv2d:
-          out_channels: 128
+          out_channels: 64
           kernel_size: 3
-          stride: 1
+          stride: 2
           padding: 0
       - flatten
       activations: elu
@@ -125,21 +135,17 @@ memory:
 
 agent:
   class: PPO
-  rollouts: 32                # 每次更新前每个环境采集 32 步；一次更新样本 = 32 × num_envs(50) = 1600
+  rollouts: 64                # [修改7] 32→64；一次更新样本 = 64 × num_envs（16 环境时 1024）
   learning_epochs: 5          # 每批数据重复训练 5 个 epoch
-  mini_batches: 8             # 每个 epoch 切成 8 个小批（每批约 200 样本）
+  mini_batches: 4             # 16 环境时每个 mini-batch 256 个样本
   discount_factor: 0.99       # 折扣因子 γ
   lambda: 0.95                # GAE 的 λ
-  learning_rate: 0.0003
-  learning_rate_scheduler: KLAdaptiveLR   # 根据 KL 散度自适应调节学习率
-  learning_rate_scheduler_kwargs:
-    kl_threshold: 0.008       # 目标 KL；偏离过大则降低学习率，过小则提高
-  # 观测归一化：对字典观测的各字段做运行均值/方差标准化。
-  # device 写死为 cuda:0，多卡 --distributed 训练时需要改成对应的卡。
-  state_preprocessor: RunningStandardScaler
-  state_preprocessor_kwargs:
-    size: observation_space
-    device: cuda:0
+  # [修改7] 固定学习率，不再使用 KLAdaptiveLR（旧日志中它几乎全程把学习率压在下限）。
+  # 训练时观察 "Learning / Learning rate" 应保持 1e-4 不变；
+  # 若 "Loss / Policy loss" 仍出现 >1 的尖峰，可先降到 5e-5。
+  learning_rate: 0.0001
+  # 观测不做标准化：图像数值范围已在环境中处理好（rgb≈[-1,1]、掩码 0/1、深度 [0,1]）。
+  state_preprocessor: null
   # 价值目标（回报）归一化，稳定 Critic 训练
   value_preprocessor: RunningStandardScaler
   value_preprocessor_kwargs:
@@ -152,10 +158,12 @@ agent:
   value_clip: 0.2             # 价值函数裁剪范围（仅在 clip_predicted_values 为 true 时生效）
   clip_predicted_values: false
   entropy_loss_scale: 0.01    # 熵正则系数，鼓励探索
-  value_loss_scale: 2.0       # 价值损失权重
-  kl_threshold: 0.0           # 0 表示不做基于 KL 的提前终止
-  rewards_shaper_scale: 2.0   # 环境奖励在送入算法前统一乘以 2
-  time_limit_bootstrap: false # 超时截断时不对价值做 bootstrap
+  value_loss_scale: 1.0       # [修改7] 2.0→1.0：网络已分开，价值损失不再需要额外加权
+  # [修改7] KL 安全阀：某个 epoch 的 KL 超过 0.05 就提前结束本次更新，
+  # 防止策略一步改动过大导致策略损失爆炸。0 表示关闭。
+  kl_threshold: 0.05
+  rewards_shaper_scale: 1.0   # 奖励不额外缩放
+  time_limit_bootstrap: true  # [修改7] 超时截断时用价值估计做 bootstrap
   experiment:
     directory: "mybuddy_direct"   # 日志根目录：logs/skrl/mybuddy_direct
     experiment_name: ""
@@ -168,7 +176,7 @@ agent:
 
 trainer:
   class: SequentialTrainer
-  # 总时间步 400000；每个"迭代"= rollouts(32) 步，约 12500 次 PPO 更新。
+  # 总时间步 400000；每个"迭代"= rollouts(64) 步，约 6250 次 PPO 更新。
   # train.py 的 --max_iterations 会把它覆盖为 max_iterations × rollouts。
   timesteps: 400000
   environment_info: log
